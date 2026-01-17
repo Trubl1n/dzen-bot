@@ -2,23 +2,22 @@ import asyncio
 import aiosqlite
 import logging
 import sys
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from playwright.async_api import async_playwright
-from aiohttp import web
 
-# --- ИМПОРТ БИБЛИОТЕКИ ---
+# --- ИМПОРТ GEMINI ---
 from google import genai
 from google.genai import types as genai_types
 
-# ================= КОНФИГУРАЦИЯ (ВСТАВЬТЕ СВОИ ДАННЫЕ) =================
+# ================= КОНФИГУРАЦИЯ =================
 
 BOT_TOKEN = '8085313764:AAGivK9Wsp4bWIrZUdTlJWGefJRAUzqZnF4'
-GEMINI_API_KEY = 'AIzaSyAa3rAK50OMQD3TwscVzWYfPTBupW0cX7o' # <-- Вставьте ключ, который вы создали
-ADMIN_ID = 858396700             # Ваш ID
-CHANNEL_ID = '-1003634910863'    # ID канала
+GEMINI_API_KEY = 'AIzaSyAa3rAK50OMQD3TwscVzWYfPTBupW0cX7o' 
+ADMIN_ID = 858396700
+CHANNEL_ID = '-1003634910863'
 
-# ДАННЫЕ ДЛЯ ПОДПИСИ
 MY_CHANNEL_LINK = "https://t.me/krasnodarskiy_veter" 
 MY_CHANNEL_NAME = "Краснодарский ветер"
 
@@ -28,51 +27,21 @@ DZEN_CHANNELS = [
     'https://dzen.ru/novosti_kuban24'
 ]
 
-# =======================================================================
-
-# Фейковый веб-сервер для Render
-async def handle(request):
-    return web.Response(text="Bot is alive")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    # Render требует слушать порт, который он выдаст в переменной окружения PORT, или 10000
-    site = web.TCPSite(runner, '0.0.0.0', 10000)
-    await site.start()
-
+# ================================================
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- НАСТРОЙКА КЛИЕНТА GEMINI ---
 client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options={'api_version': 'v1beta'} # Для версий 2.5 и 3 нужна бета
+    http_options={'api_version': 'v1beta'}
 )
 
-# Настройки безопасности (разрешаем всё, чтобы не блочил новости про ДТП)
 safety_settings = [
-    genai_types.SafetySetting(
-        category='HARM_CATEGORY_HATE_SPEECH',
-        threshold='BLOCK_NONE'
-    ),
-    genai_types.SafetySetting(
-        category='HARM_CATEGORY_DANGEROUS_CONTENT',
-        threshold='BLOCK_NONE'
-    ),
-    genai_types.SafetySetting(
-        category='HARM_CATEGORY_HARASSMENT',
-        threshold='BLOCK_NONE'
-    ),
-    genai_types.SafetySetting(
-        category='HARM_CATEGORY_SEXUALLY_EXPLICIT',
-        threshold='BLOCK_NONE'
-    ),
+    genai_types.SafetySetting(category='HARM_CATEGORY_HATE_SPEECH', threshold='BLOCK_NONE'),
+    genai_types.SafetySetting(category='HARM_CATEGORY_DANGEROUS_CONTENT', threshold='BLOCK_NONE'),
 ]
 
 # --- БАЗА ДАННЫХ ---
@@ -91,103 +60,104 @@ async def add_article(url, title, status='pending'):
         await db.execute('INSERT OR IGNORE INTO articles (url, title, status) VALUES (?, ?, ?)', (url, title, status))
         await db.commit()
 
-# --- ИИ: ГЕНЕРАЦИЯ ПОСТА ---
+# --- ИИ ГЕНЕРАЦИЯ ---
 async def generate_post_content(text_content):
-    """Просит ИИ переписать новость"""
-    
     prompt = (
-        f"Ты — редактор Telegram-канала '{MY_CHANNEL_NAME}'. Твоя задача — сделать из текста новости короткий, красивый пост.\n"
-        f"Исходный текст: {text_content[:8000]}...\n\n" 
-        f"ТРЕБОВАНИЯ К ФОРМАТУ:\n"
-        f"1. Первая строка: Кликбейтный заголовок (но правдивый), выделенный жирным шрифтом (тэги <b> и </b>). Добавь 1-2 эмодзи в конце заголовка.\n"
-        f"2. Сделай пустую строку после заголовка.\n"
-        f"3. Далее напиши суть новости (саммари) в 2-3 предложениях. Убери лишнюю воду.\n"
-        f"4. Если новость ОЧЕНЬ скучная, старая или рекламная, верни просто слово 'SKIP'.\n"
-        f"5. НЕ пиши никаких 'Здравствуй', 'Вот пост'. Сразу выдавай готовый текст."
+        f"Ты — редактор канала '{MY_CHANNEL_NAME}'. Сделай короткий пост.\n"
+        f"Текст: {text_content[:8000]}...\n\n" 
+        f"ТРЕБОВАНИЯ:\n"
+        f"1. Заголовок жирным (<b>текст</b>) + эмодзи.\n"
+        f"2. Пустая строка.\n"
+        f"3. Саммари (суть) в 2-3 предложениях.\n"
+        f"4. Если новость старая, скучная или реклама -> верни 'SKIP'."
     )
-
     try:
-        # ИСПОЛЬЗУЕМ GEMINI 2.5 FLASH (Она есть в вашем списке)
         response = await client.aio.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                safety_settings=safety_settings
-            )
+            config=genai_types.GenerateContentConfig(safety_settings=safety_settings)
         )
-        
-        result = response.text.strip()
-        result = result.replace("```html", "").replace("```", "")
-        return result
-
+        return response.text.strip().replace("```html", "").replace("```", "")
     except Exception as e:
-        logging.error(f"AI Error: {e}")
         return "SKIP"
 
-# --- ПАРСЕР ---
+# --- ПАРСЕР С ФИЛЬТРОМ ДАТ ---
 async def parse_dzen_and_process():
     logging.info("♻️ Запуск браузера...")
     
     async with async_playwright() as p:
-        # ЗАПУСК В РЕЖИМЕ ЖЕСТКОЙ ЭКОНОМИИ
+        # ЗАПУСК В РЕЖИМЕ ЖЕСТКОЙ ЭКОНОМИИ (Для Render Free)
         browser = await p.chromium.launch(
             headless=True,
             args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage', # Важно для Docker
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--single-process', # !!! ОДИН ПРОЦЕСС (Экономит кучу памяти, но менее стабильно)
-                '--disable-gpu',
-                '--js-flags="--max-old-space-size=256"' # Ограничиваем память JS движка
+                '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
+                '--single-process', '--disable-gpu', '--js-flags="--max-old-space-size=256"'
             ]
         )
         
-        # Создаем контекст
         context = await browser.new_context()
-        
-        # БЛОКИРУЕМ ВСЁ ЛИШНЕЕ (Картинки, шрифты, стили, медиа)
-        # Это снизит потребление памяти в 2 раза
+        # Блокируем всё лишнее для скорости
         await context.route("**/*.{png,jpg,jpeg,svg,mp4,webp,css,woff,woff2,gif}", lambda route: route.abort())
-        # Блокируем рекламные скрипты и метрики (Яндекс, Mail.ru)
-        await context.route("**/*yandex*", lambda route: route.abort())
-        await context.route("**/*mail.ru*", lambda route: route.abort())
-
         page = await context.new_page()
         
         for url in DZEN_CHANNELS:
             try:
                 logging.info(f"🔍 Смотрю канал: {url}")
-                # Уменьшаем таймаут, чтобы не висеть долго
                 await page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 
-                # Ищем ссылки
+                # Ищем ссылки (берем больше, топ-5, чтобы пропустить закрепы)
                 link_elements = await page.query_selector_all('a[href*="/a/"]')
                 found_links = []
-                for el in link_elements[:2]: # БЕРЕМ ТОЛЬКО 2 ПОСЛЕДНИЕ (чтобы не грузить память)
+                for el in link_elements[:5]: 
                     href = await el.get_attribute('href')
                     if not href: continue
                     if not href.startswith('http'): href = f"https://dzen.ru{href}"
                     found_links.append(href.split('?')[0])
 
+                # Счетчик свежих новостей для этого канала
+                processed_count = 0 
+
                 for article_url in found_links:
+                    # Если уже обрабатывали - пропускаем
                     if await url_exists(article_url): continue 
                     
-                    logging.info(f"📄 Читаю статью: {article_url}")
+                    # Чтобы не перегрузить сервер, берем только 1-2 новости за раз
+                    if processed_count >= 1: break
+
+                    logging.info(f"📄 Проверяю статью: {article_url}")
                     
                     try:
                         await page.goto(article_url, timeout=60000, wait_until="domcontentloaded")
+                        
+                        # --- ПРОВЕРКА ДАТЫ ---
+                        try:
+                            # Ищем мета-тег с датой публикации
+                            date_meta = await page.locator('meta[property="article:published_time"]').get_attribute('content')
+                            # Формат обычно: 2025-12-22T10:00:00+03:00
+                            if date_meta:
+                                pub_date_str = date_meta.split('T')[0] # Берем только дату 2025-12-22
+                                pub_date = datetime.strptime(pub_date_str, "%Y-%m-%d")
+                                
+                                # Если новости больше 2 дней - СКИПАЕМ
+                                if (datetime.now() - pub_date).days > 1:
+                                    logging.info(f"⚠️ Старая новость ({pub_date_str}). Пропускаю.")
+                                    # Записываем в базу как processed, чтобы больше не открывать
+                                    await add_article(article_url, "Old News", status='skipped')
+                                    continue
+                        except Exception as date_e:
+                            logging.warning(f"Не нашел дату, пробую обработать так: {date_e}")
+
+                        # --- ПОЛУЧЕНИЕ ТЕКСТА ---
                         article_body = await page.inner_text('article')
                         if not article_body: article_body = await page.inner_text('body')
 
-                        # Очищаем память сразу после получения текста
                         post_text = await generate_post_content(article_body)
                         
                         if post_text != "SKIP":
                             await send_to_admin_approval(post_text, article_url)
                             await add_article(article_url, "Processed", status='review')
+                            processed_count += 1 # Увеличиваем счетчик обработанных
                         else:
                             await add_article(article_url, "Skipped", status='rejected')
                             
@@ -197,11 +167,10 @@ async def parse_dzen_and_process():
             except Exception as e:
                 logging.error(f"Ошибка канала: {e}")
 
-        # Явно закрываем всё, чтобы освободить память
         await page.close()
         await context.close()
         await browser.close()
-        logging.info("✅ Браузер закрыт, память освобождена")
+        logging.info("✅ Цикл завершен")
 
 # --- БОТ: ОТПРАВКА ---
 async def send_to_admin_approval(post_text, original_link):
@@ -209,57 +178,45 @@ async def send_to_admin_approval(post_text, original_link):
     builder.button(text="✅ В канал", callback_data="approve")
     builder.button(text="❌ Удалить", callback_data="reject")
     builder.adjust(2)
-
     admin_text = f"{post_text}\n\n----------\n<i>Источник: {original_link}</i>"
-    
-    if len(admin_text) > 4096:
-        admin_text = admin_text[:4000] + "..."
-
+    if len(admin_text) > 4096: admin_text = admin_text[:4000] + "..."
     await bot.send_message(ADMIN_ID, admin_text, reply_markup=builder.as_markup(), parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.callback_query()
 async def handle_buttons(callback: types.CallbackQuery):
     action = callback.data
     content = callback.message.html_text 
-    
-    if "----------" in content:
-        clean_post = content.split("----------")[0].strip()
-    else:
-        clean_post = content
+    if "----------" in content: clean_post = content.split("----------")[0].strip()
+    else: clean_post = content
 
     if action == "approve":
         footer = f"<a href='{MY_CHANNEL_LINK}'>{MY_CHANNEL_NAME} | Подписаться</a>"
-        final_message = f"{clean_post}\n\n{footer}"
-
         try:
-            await bot.send_message(CHANNEL_ID, final_message, parse_mode="HTML", disable_web_page_preview=True)
+            await bot.send_message(CHANNEL_ID, f"{clean_post}\n\n{footer}", parse_mode="HTML", disable_web_page_preview=True)
             await callback.message.edit_text(f"{clean_post}\n\n✅ <b>Опубликовано!</b>", parse_mode="HTML")
-        except Exception as e:
-             await callback.message.edit_text(f"Ошибка: {e}")
-
-    elif action == "reject":
-        await callback.message.delete()
-    
+        except Exception as e: await callback.message.edit_text(f"Ошибка: {e}")
+    elif action == "reject": await callback.message.delete()
     await callback.answer()
+
+# --- ВЕБ-СЕРВЕР ---
+from aiohttp import web
+async def handle(request): return web.Response(text="Bot is running")
+async def start_server():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', 10000).start()
 
 async def scheduler():
     while True:
         await parse_dzen_and_process()
-        logging.info("Цикл завершен. Жду 30 минут...")
-        await asyncio.sleep(1800)
+        logging.info("Жду 20 минут...") # Даем серверу остыть
+        await asyncio.sleep(1200)
 
 async def main():
-    await init_db()
-    # Запускаем фейковый сервер
-    await start_web_server()
-    # Запускаем планировщик и бота
+    await init_db(); await start_server()
     asyncio.create_task(scheduler())
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-    asyncio.run(main())
-
+if __name__ == "__main__": asyncio.run(main())
