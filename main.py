@@ -129,69 +129,64 @@ async def parse_dzen_and_process():
     logging.info("Ищу новости...")
     
     async with async_playwright() as p:
-        # ЗАПУСК С ПАРАМЕТРАМИ ЭКОНОМИИ ПАМЯТИ
+        # ЗАПУСК БРАУЗЕРА С ОПТИМИЗАЦИЕЙ
         browser = await p.chromium.launch(
             headless=True,
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage', # Важно для Docker
+                '--disable-dev-shm-usage',
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--single-process', # Один процесс вместо кучи (экономит память)
+                '--single-process',
                 '--disable-gpu'
             ]
         )
-        # Блокируем картинки и шрифты, чтобы не тратить память
-        context = await browser.new_context()
-        await context.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2}", lambda route: route.abort())
         
-        page = await browser.new_page()
+        # !!! ВАЖНО: Блокируем картинки, видео и шрифты, чтобы ускорить загрузку
+        context = await browser.new_context()
+        await context.route("**/*.{png,jpg,jpeg,svg,mp4,webp,css,woff,woff2}", lambda route: route.abort())
+        
+        page = await context.new_page()
         
         for url in DZEN_CHANNELS:
             try:
-                await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                await asyncio.sleep(3) # Ждем прогрузки JS
+                # !!! Увеличиваем таймаут до 90 секунд (было 60000 или по умолчанию 30000)
+                await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+                await asyncio.sleep(5) # Даем чуть больше времени на прогрузку скриптов
                 
-                # Ищем ссылки на статьи
                 link_elements = await page.query_selector_all('a[href*="/a/"]')
                 
                 found_links = []
-                # Берем только первые 3, чтобы не нагружать
                 for el in link_elements[:3]: 
                     href = await el.get_attribute('href')
                     if not href: continue
                     if not href.startswith('http'): href = f"https://dzen.ru{href}"
-                    # Убираем мусор из ссылки (?utm_...)
                     href = href.split('?')[0]
                     found_links.append(href)
 
                 for article_url in found_links:
-                    # Проверяем базу
                     if await url_exists(article_url):
                         continue 
                     
                     logging.info(f"Читаю статью: {article_url}")
                     
                     try:
-                        # Заходим внутрь статьи
-                        await page.goto(article_url, timeout=30000, wait_until="domcontentloaded")
-                        await asyncio.sleep(2)
+                        # !!! ВОТ ЗДЕСЬ БЫЛА ОШИБКА. Увеличиваем время ожидания статьи до 2 минут (120000 мс)
+                        await page.goto(article_url, timeout=120000, wait_until="domcontentloaded")
+                        await asyncio.sleep(3)
                         
-                        # Парсим текст
                         article_body = await page.inner_text('article')
                         
-                        # Если не нашли тег article, пробуем просто body (грубо, но сработает)
                         if not article_body:
                              article_body = await page.inner_text('body')
 
                         if not article_body or len(article_body) < 100:
-                            logging.warning("Текст слишком короткий или не найден")
+                            logging.warning("Не удалось извлечь текст статьи")
                             await add_article(article_url, "Error parsing", status='error')
                             continue
 
-                        # Отправляем в ИИ
                         post_text = await generate_post_content(article_body)
                         
                         if post_text == "SKIP":
@@ -199,12 +194,12 @@ async def parse_dzen_and_process():
                             await add_article(article_url, "Skipped by AI", status='rejected')
                             continue
 
-                        # Если ок — шлем админу
                         await send_to_admin_approval(post_text, article_url)
                         await add_article(article_url, "Processed", status='review')
                         
                     except Exception as e:
-                         logging.error(f"Ошибка внутри статьи {article_url}: {e}")
+                        # Если даже за 2 минуты не успел - пишем ошибку, но не падаем
+                        logging.error(f"Ошибка внутри статьи {article_url}: {e}")
 
             except Exception as e:
                 logging.error(f"Ошибка канала {url}: {e}")
@@ -268,4 +263,5 @@ async def main():
 if __name__ == "__main__":
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
     asyncio.run(main())
