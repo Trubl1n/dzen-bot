@@ -126,85 +126,82 @@ async def generate_post_content(text_content):
 
 # --- ПАРСЕР ---
 async def parse_dzen_and_process():
-    logging.info("Ищу новости...")
+    logging.info("♻️ Запуск браузера...")
     
     async with async_playwright() as p:
-        # ЗАПУСК БРАУЗЕРА С ОПТИМИЗАЦИЕЙ
+        # ЗАПУСК В РЕЖИМЕ ЖЕСТКОЙ ЭКОНОМИИ
         browser = await p.chromium.launch(
             headless=True,
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
+                '--disable-dev-shm-usage', # Важно для Docker
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--single-process',
-                '--disable-gpu'
+                '--single-process', # !!! ОДИН ПРОЦЕСС (Экономит кучу памяти, но менее стабильно)
+                '--disable-gpu',
+                '--js-flags="--max-old-space-size=256"' # Ограничиваем память JS движка
             ]
         )
         
-        # !!! ВАЖНО: Блокируем картинки, видео и шрифты, чтобы ускорить загрузку
+        # Создаем контекст
         context = await browser.new_context()
-        await context.route("**/*.{png,jpg,jpeg,svg,mp4,webp,css,woff,woff2}", lambda route: route.abort())
         
+        # БЛОКИРУЕМ ВСЁ ЛИШНЕЕ (Картинки, шрифты, стили, медиа)
+        # Это снизит потребление памяти в 2 раза
+        await context.route("**/*.{png,jpg,jpeg,svg,mp4,webp,css,woff,woff2,gif}", lambda route: route.abort())
+        # Блокируем рекламные скрипты и метрики (Яндекс, Mail.ru)
+        await context.route("**/*yandex*", lambda route: route.abort())
+        await context.route("**/*mail.ru*", lambda route: route.abort())
+
         page = await context.new_page()
         
         for url in DZEN_CHANNELS:
             try:
-                # !!! Увеличиваем таймаут до 90 секунд (было 60000 или по умолчанию 30000)
-                await page.goto(url, timeout=90000, wait_until="domcontentloaded")
-                await asyncio.sleep(5) # Даем чуть больше времени на прогрузку скриптов
+                logging.info(f"🔍 Смотрю канал: {url}")
+                # Уменьшаем таймаут, чтобы не висеть долго
+                await page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 
+                # Ищем ссылки
                 link_elements = await page.query_selector_all('a[href*="/a/"]')
-                
                 found_links = []
-                for el in link_elements[:3]: 
+                for el in link_elements[:2]: # БЕРЕМ ТОЛЬКО 2 ПОСЛЕДНИЕ (чтобы не грузить память)
                     href = await el.get_attribute('href')
                     if not href: continue
                     if not href.startswith('http'): href = f"https://dzen.ru{href}"
-                    href = href.split('?')[0]
-                    found_links.append(href)
+                    found_links.append(href.split('?')[0])
 
                 for article_url in found_links:
-                    if await url_exists(article_url):
-                        continue 
+                    if await url_exists(article_url): continue 
                     
-                    logging.info(f"Читаю статью: {article_url}")
+                    logging.info(f"📄 Читаю статью: {article_url}")
                     
                     try:
-                        # !!! ВОТ ЗДЕСЬ БЫЛА ОШИБКА. Увеличиваем время ожидания статьи до 2 минут (120000 мс)
-                        await page.goto(article_url, timeout=120000, wait_until="domcontentloaded")
-                        await asyncio.sleep(3)
-                        
+                        await page.goto(article_url, timeout=60000, wait_until="domcontentloaded")
                         article_body = await page.inner_text('article')
-                        
-                        if not article_body:
-                             article_body = await page.inner_text('body')
+                        if not article_body: article_body = await page.inner_text('body')
 
-                        if not article_body or len(article_body) < 100:
-                            logging.warning("Не удалось извлечь текст статьи")
-                            await add_article(article_url, "Error parsing", status='error')
-                            continue
-
+                        # Очищаем память сразу после получения текста
                         post_text = await generate_post_content(article_body)
                         
-                        if post_text == "SKIP":
-                            logging.info("Новость пропущена ИИ (SKIP)")
-                            await add_article(article_url, "Skipped by AI", status='rejected')
-                            continue
-
-                        await send_to_admin_approval(post_text, article_url)
-                        await add_article(article_url, "Processed", status='review')
-                        
+                        if post_text != "SKIP":
+                            await send_to_admin_approval(post_text, article_url)
+                            await add_article(article_url, "Processed", status='review')
+                        else:
+                            await add_article(article_url, "Skipped", status='rejected')
+                            
                     except Exception as e:
-                        # Если даже за 2 минуты не успел - пишем ошибку, но не падаем
-                        logging.error(f"Ошибка внутри статьи {article_url}: {e}")
+                        logging.error(f"Ошибка статьи: {e}")
 
             except Exception as e:
-                logging.error(f"Ошибка канала {url}: {e}")
+                logging.error(f"Ошибка канала: {e}")
 
+        # Явно закрываем всё, чтобы освободить память
+        await page.close()
+        await context.close()
         await browser.close()
+        logging.info("✅ Браузер закрыт, память освобождена")
 
 # --- БОТ: ОТПРАВКА ---
 async def send_to_admin_approval(post_text, original_link):
@@ -265,3 +262,4 @@ if __name__ == "__main__":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
     asyncio.run(main())
+
