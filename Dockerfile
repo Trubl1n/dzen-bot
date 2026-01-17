@@ -9,7 +9,8 @@ COPY . .
 
 # Устанавливаем библиотеки Python
 # (Playwright и его браузеры уже есть в системе, их качать не надо)
-RUN pip install --no-cache-dir aiogram google-genai aiosqlite aiohttp
+RUN pip install --no-cache-dir aiogram google-genai aiosqlite aiohttp playwright
 
 # Команда запуска
+
 CMD ["python", "main.py"]
