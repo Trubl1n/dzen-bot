@@ -2,6 +2,7 @@ import asyncio
 import aiosqlite
 import logging
 import sys
+import difflib # <-- Библиотека для сравнения текста
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -47,13 +48,39 @@ safety_settings = [
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect('news.db') as db:
+        # Добавили поле title_hash для проверки заголовков
         await db.execute('CREATE TABLE IF NOT EXISTS articles (url TEXT PRIMARY KEY, title TEXT, status TEXT)')
         await db.commit()
 
-async def url_exists(url):
+# --- ПРОВЕРКА НА ДУБЛИКАТЫ (САМОЕ ВАЖНОЕ) ---
+async def is_duplicate(url, title):
     async with aiosqlite.connect('news.db') as db:
-        cursor = await db.execute('SELECT 1 FROM articles WHERE url = ?', (url,))
-        return await cursor.fetchone() is not None
+        # 1. Проверка по URL (прямое совпадение)
+        cursor = await db.execute('SELECT title FROM articles WHERE url = ?', (url,))
+        if await cursor.fetchone():
+            return True
+
+        # 2. Проверка по Заголовку (на случай, если ссылка изменилась)
+        # Если заголовок пустой, пропускаем проверку
+        if not title:
+            return False
+            
+        # Достаем все заголовки за последние 24 часа (или все, если база маленькая)
+        cursor = await db.execute('SELECT title FROM articles WHERE title IS NOT NULL')
+        rows = await cursor.fetchall()
+        
+        for row in rows:
+            db_title = row[0]
+            if not db_title: continue
+            
+            # Сравниваем похожесть строк (от 0 до 1)
+            # Если заголовки похожи на 85% и более — это одна и та же новость
+            similarity = difflib.SequenceMatcher(None, title.lower(), db_title.lower()).ratio()
+            if similarity > 0.85:
+                logging.info(f"♻️ Обнаружен дубликат по заголовку: '{title}' совпадает с '{db_title}'")
+                return True
+                
+        return False
 
 async def add_article(url, title, status='pending'):
     async with aiosqlite.connect('news.db') as db:
@@ -69,7 +96,8 @@ async def generate_post_content(text_content):
         f"1. Заголовок жирным (<b>текст</b>) + эмодзи.\n"
         f"2. Пустая строка.\n"
         f"3. Саммари (суть) в 2-3 предложениях.\n"
-        f"4. Если новость старая, скучная или реклама -> верни 'SKIP'."
+        f"4. Если новость старая (в тексте есть даты прошлого года или старые месяцы) -> верни 'SKIP'.\n"
+        f"5. Если новость рекламная или скучная -> верни 'SKIP'."
     )
     try:
         response = await client.aio.models.generate_content(
@@ -81,12 +109,11 @@ async def generate_post_content(text_content):
     except Exception as e:
         return "SKIP"
 
-# --- ПАРСЕР С ФИЛЬТРОМ ДАТ ---
+# --- ПАРСЕР ---
 async def parse_dzen_and_process():
     logging.info("♻️ Запуск браузера...")
     
     async with async_playwright() as p:
-        # ЗАПУСК В РЕЖИМЕ ЖЕСТКОЙ ЭКОНОМИИ (Для Render Free)
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -97,7 +124,6 @@ async def parse_dzen_and_process():
         )
         
         context = await browser.new_context()
-        # Блокируем всё лишнее для скорости
         await context.route("**/*.{png,jpg,jpeg,svg,mp4,webp,css,woff,woff2,gif}", lambda route: route.abort())
         page = await context.new_page()
         
@@ -106,7 +132,6 @@ async def parse_dzen_and_process():
                 logging.info(f"🔍 Смотрю канал: {url}")
                 await page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 
-                # Ищем ссылки (берем больше, топ-5, чтобы пропустить закрепы)
                 link_elements = await page.query_selector_all('a[href*="/a/"]')
                 found_links = []
                 for el in link_elements[:5]: 
@@ -115,51 +140,59 @@ async def parse_dzen_and_process():
                     if not href.startswith('http'): href = f"https://dzen.ru{href}"
                     found_links.append(href.split('?')[0])
 
-                # Счетчик свежих новостей для этого канала
                 processed_count = 0 
 
                 for article_url in found_links:
-                    # Если уже обрабатывали - пропускаем
-                    if await url_exists(article_url): continue 
-                    
-                    # Чтобы не перегрузить сервер, берем только 1-2 новости за раз
                     if processed_count >= 1: break
+
+                    # Предварительная проверка (если ссылка есть в базе, даже не открываем)
+                    # Заголовок пока не знаем, передаем None
+                    if await is_duplicate(article_url, None): 
+                        continue
 
                     logging.info(f"📄 Проверяю статью: {article_url}")
                     
                     try:
                         await page.goto(article_url, timeout=60000, wait_until="domcontentloaded")
                         
-                        # --- ПРОВЕРКА ДАТЫ ---
+                        # 1. ПРОВЕРКА ДАТЫ
                         try:
-                            # Ищем мета-тег с датой публикации
                             date_meta = await page.locator('meta[property="article:published_time"]').get_attribute('content')
-                            # Формат обычно: 2025-12-22T10:00:00+03:00
                             if date_meta:
-                                pub_date_str = date_meta.split('T')[0] # Берем только дату 2025-12-22
-                                pub_date = datetime.strptime(pub_date_str, "%Y-%m-%d")
-                                
-                                # Если новости больше 2 дней - СКИПАЕМ
+                                pub_date = datetime.strptime(date_meta.split('T')[0], "%Y-%m-%d")
                                 if (datetime.now() - pub_date).days > 1:
-                                    logging.info(f"⚠️ Старая новость ({pub_date_str}). Пропускаю.")
-                                    # Записываем в базу как processed, чтобы больше не открывать
+                                    logging.info(f"⚠️ Старая новость. Скип.")
+                                    # Пишем в базу, что это старье
                                     await add_article(article_url, "Old News", status='skipped')
                                     continue
-                        except Exception as date_e:
-                            logging.warning(f"Не нашел дату, пробую обработать так: {date_e}")
+                        except: pass
 
-                        # --- ПОЛУЧЕНИЕ ТЕКСТА ---
+                        # 2. ПОЛУЧЕНИЕ ЗАГОЛОВКА ДЛЯ ПРОВЕРКИ ДУБЛЕЙ
+                        # Пытаемся найти h1
+                        article_title = ""
+                        try:
+                            article_title = await page.inner_text('h1')
+                        except: pass
+                        
+                        # ВТОРАЯ ПРОВЕРКА НА ДУБЛИ (уже по заголовку)
+                        if await is_duplicate(article_url, article_title):
+                            logging.info("⚠️ Дубль по заголовку. Скип.")
+                            await add_article(article_url, article_title, status='duplicate')
+                            continue
+
+                        # Получение текста
                         article_body = await page.inner_text('article')
                         if not article_body: article_body = await page.inner_text('body')
 
                         post_text = await generate_post_content(article_body)
                         
                         if post_text != "SKIP":
-                            await send_to_admin_approval(post_text, article_url)
-                            await add_article(article_url, "Processed", status='review')
-                            processed_count += 1 # Увеличиваем счетчик обработанных
+                            await send_to_admin_approval(post_text, article_url, article_title)
+                            # Сразу записываем в базу, чтобы при рестарте не забыл
+                            await add_article(article_url, article_title, status='review')
+                            processed_count += 1
                         else:
-                            await add_article(article_url, "Skipped", status='rejected')
+                            await add_article(article_url, article_title, status='rejected')
                             
                     except Exception as e:
                         logging.error(f"Ошибка статьи: {e}")
@@ -170,16 +203,18 @@ async def parse_dzen_and_process():
         await page.close()
         await context.close()
         await browser.close()
-        logging.info("✅ Цикл завершен")
 
 # --- БОТ: ОТПРАВКА ---
-async def send_to_admin_approval(post_text, original_link):
+async def send_to_admin_approval(post_text, original_link, title):
     builder = InlineKeyboardBuilder()
+    # Добавляем callback c действием reject_db, чтобы точно пометить в базе
     builder.button(text="✅ В канал", callback_data="approve")
-    builder.button(text="❌ Удалить", callback_data="reject")
+    builder.button(text="❌ Удалить", callback_data="reject") 
     builder.adjust(2)
+    
     admin_text = f"{post_text}\n\n----------\n<i>Источник: {original_link}</i>"
     if len(admin_text) > 4096: admin_text = admin_text[:4000] + "..."
+    
     await bot.send_message(ADMIN_ID, admin_text, reply_markup=builder.as_markup(), parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.callback_query()
@@ -194,8 +229,14 @@ async def handle_buttons(callback: types.CallbackQuery):
         try:
             await bot.send_message(CHANNEL_ID, f"{clean_post}\n\n{footer}", parse_mode="HTML", disable_web_page_preview=True)
             await callback.message.edit_text(f"{clean_post}\n\n✅ <b>Опубликовано!</b>", parse_mode="HTML")
+            # Статус в базе уже 'review' или 'processed', все ок
         except Exception as e: await callback.message.edit_text(f"Ошибка: {e}")
-    elif action == "reject": await callback.message.delete()
+
+    elif action == "reject":
+        # Просто удаляем сообщение, в базе она уже есть (мы добавили её при парсинге)
+        # И второй раз бот её не пришлет, потому что она есть в базе
+        await callback.message.delete()
+    
     await callback.answer()
 
 # --- ВЕБ-СЕРВЕР ---
@@ -210,7 +251,7 @@ async def start_server():
 async def scheduler():
     while True:
         await parse_dzen_and_process()
-        logging.info("Жду 20 минут...") # Даем серверу остыть
+        logging.info("Жду 20 минут...")
         await asyncio.sleep(1200)
 
 async def main():
