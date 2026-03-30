@@ -14,10 +14,9 @@ from google.genai import types as genai_types
 
 # ================= КОНФИГУРАЦИЯ =================
 
-BOT_TOKEN = '8085313764:AAGivK9Wsp4bWIrZUdTlJWGefJRAUzqZnF4'
-GEMINI_API_KEY = 'AIzaSyAa3rAK50OMQD3TwscVzWYfPTBupW0cX7o' 
-ADMIN_ID = 858396700
-CHANNEL_ID = '-1003634910863'
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+ADMIN_ID = int(os.getenv('ADMIN_ID'))
 
 MY_CHANNEL_LINK = "https://t.me/krasnodarskiy_veter" 
 MY_CHANNEL_NAME = "Краснодарский ветер"
